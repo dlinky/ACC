@@ -1,10 +1,15 @@
 import os
+import shutil
+import glob
+
 import cv2
 import numpy as np
 import time
 import sys
 import copy
-from matplotlib import pyplot as plt
+import argparse
+from sklearn.cluster import KMeans
+from sklearn import preprocessing
 
 import labelimg_xml
 import get_roi
@@ -15,6 +20,43 @@ current_filename = ''
 morph_kernel = 11
 morph_iteration = 1
 magnification = 0
+
+# parameters
+parser = argparse.ArgumentParser(description='Complete Blood Count with OpenCV')
+parser.add_argument('-si', '--save-images', action='store_true', help='save output images')
+parser.add_argument('-t', '--show-running-time', action='store_true', help='show process running time')
+parser.add_argument('-rs', '--remove-scope', action='store_true', help='image has scope')
+parser.add_argument('-m', '--magnification', default=1000, action='store', help='set manual magnification')
+args = parser.parse_args()
+
+specific_magnification = False
+if args.magnification is not None:
+    specific_magnification = True
+    magnification = args.magnification
+    
+    
+# paths
+INPUT_PATH = os.path.join(os.getcwd(), 'input')
+OUTPUT_PATH = os.path.join(os.getcwd(), 'output')
+XML_PATH = os.path.join(OUTPUT_PATH, 'xml')
+THRESHOLD_PATH = os.path.join(OUTPUT_PATH, 'threshold')
+LABEL_PATH = os.path.join(OUTPUT_PATH, 'labeled')
+BBOX_PATH = os.path.join(OUTPUT_PATH, 'bbox')
+CLASSES_PATH = os.path.join(OUTPUT_PATH, 'bbox', 'classes')
+
+if os.path.exists(OUTPUT_PATH):
+    shutil.rmtree(OUTPUT_PATH)
+os.makedirs(XML_PATH)
+if args.save_images:
+    os.makedirs(THRESHOLD_PATH)
+    os.makedirs(LABEL_PATH)
+    os.makedirs(CLASSES_PATH)
+    os.makedirs(BBOX_PATH)
+
+
+def error(msg):
+    print(msg)
+    sys.exit(0)
 
 
 class Clock:
@@ -49,58 +91,78 @@ clk_labeling = Clock('Labeling')
 clk_organize_bbox = Clock('Organizing bbox')
 
 
-# 경로 설정
-path_dir = (os.getcwd() + '/').replace(r'\\', r'/')
-original_dir = path_dir + 'original/'
-result_dir = path_dir + 'result/'
-
-# 디버그 파일 경로
-debug_dir = path_dir + '/debug/'
-threshold_value_dir = debug_dir + 'threshold(v)/'
-threshold_hue_dir = debug_dir + 'threshold(h)/'
-threshed_dir = debug_dir + 'threshed/'
-flood_fill_dir = debug_dir + 'flood_fill/'
-morph_open_dir = debug_dir + 'morphology(open)/'
-merge_post_process_dir = debug_dir + 'merged/'
-ccl_dir = debug_dir + 'ccl/'
-bbox_dir = debug_dir + 'bboxes/'
+def threshold(src):
+    l,a,b = cv2.split(cv2.cvtColor(src, cv2.COLOR_BGR2LAB))
+    threshed = cv2.threshold(a, 0, 255, cv2.THRESH_OTSU)
+    cnts = cv2.findContours(threshed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cnts = cnts[0] if len(cnts) == 2 else cnts[1]
+    for c in cnts:
+        flood_filled = cv2.drawContours(threshed, [c], 0, (255, 255, 255), -1)
+    morph_open = cv2.morphologyEx(flood_filled, cv2.MORPH_OPEN, np.ones((5, 5)), iterations=2)
+    return morph_open
 
 
-def empty(self):
-    pass
+def remove_boarding_bbox(labels, stats, edge_error):
+    height, width = labels.shape()
+    for idx, box in enumerate(stats[:]):
+        lboard = box[0] < edge_error
+        rboard = box[0] + box[2] > height - edge_error
+        tboard = box[1] < edge_error
+        bboard = box[1] + box[3] > width - edge_error
+        if lboard or rboard or tboard or bboard:
+            labels[labels == idx] = 0
+            stats.remove(box)
+    return labels, stats
 
 
-def set_directories():
-    """
-    자동으로 디렉토리 설정
-    """
+def set_class_norm(stats):
+    sizes = stats[:,4]
+    dimension = 1
+    num_cluster = 3
+    min_max = [min(sizes), max(sizes)]
+    quantile = (min_max[1]-min_max[0])/num_cluster/2
+    clst_mu = np.array([quantile*(2*i+1) + min_max[0] for i in range(num_cluster)])
+    distance = (sizes - clst_mu.reshape(num_cluster, 1, dimension))
+    distance = distance * distance
+    distance = distance.sum(axis=2).T
+    cluster = np.where(distance==distance.min(axis=1).reshape((len(sizes),1)))[1]
+    clst_mu_old = clst_mu.copy()
+    for i in range(num_cluster):
+        clst_mu[i] = np.mean(sizes[np.where(cluster==i)[0]], axis=0)
+    clst_mu = clst_mu_old*np.isnan(clst_mu) + np.nan_to_num(clst_mu)
 
-    print('Set directories ', end='')
-    if debug_switch == 1:
-        print('with debug')
-    else:
-        print('')
+    maxEpoch = 10
 
-    os.makedirs(original_dir, exist_ok=True)
-    os.makedirs(result_dir, exist_ok=True)
-    if debug_switch == 1:
-        os.makedirs(threshold_value_dir, exist_ok=True)
-        os.makedirs(threshold_hue_dir, exist_ok=True)
-        os.makedirs(threshed_dir, exist_ok=True)
-        os.makedirs(flood_fill_dir, exist_ok=True)
-        os.makedirs(morph_open_dir, exist_ok=True)
-        os.makedirs(merge_post_process_dir, exist_ok=True)
-        os.makedirs(ccl_dir, exist_ok=True)
-        os.makedirs(bbox_dir, exist_ok=True)
+    for epoch in range(maxEpoch):
+        distance = (sizes - clst_mu.reshape(num_cluster, 1, dimension))
+        distance = distance * distance
+        distance = distance.sum(axis=2).T
+        cluster = np.where(distance == distance.min(axis=1).reshape((len(sizes), 1)))[1]
+        clst_mu_old = clst_mu.copy()
+        for i in range(num_cluster):
+            clst_mu[i] = np.mean(sizes[np.where(cluster == i)[0]], axis=0)
+        clst_mu = clst_mu_old * np.isnan(clst_mu) + np.nan_to_num(clst_mu)
 
 
-def print_image(img, mask_list):
-    h, s, v = cv2.split(cv2.cvtColor(img, cv2.COLOR_BGR2HSV))
-    v = cv2.bitwise_and(v, v, mask=mask_list[1])
-    img_masked = cv2.cvtColor(cv2.merge((h, s, v)), cv2.COLOR_HSV2BGR)
-    cv2.imwrite(mask_list[0] + current_filename, img_masked)
-    cv2.putText(img_masked, mask_list[2], (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 255), 2)
-    return img_masked
+def classify_boxes(img, stats):
+    for box in stats:
+        mini_img = img[box[1]:box[1]+box[3], box[0]:box[0]+box[2]]
+        box_size = box[4]
+        if box_size >
+
+
+
+file_list = glob.glob(INPUT_PATH + '/*.jpg')
+if len(file_list) == 0:
+    error("Error: No input files found")
+for idx, file in enumerate(file_list):
+    file_id = file.split(".jpg", 1)[0]
+    img = cv2.imread(os.path.join(INPUT_PATH, file))
+    threshed = threshold(img)
+    _, labels, stats, _ = cv2.connectedComponentsWithStats(img)
+    labels, stats = remove_boarding_bbox(labels, stats, 1)
+    stats = classify_boxes(img, stats)
+    plt_bboxes = find_plt(img, labels)
 
 
 def post_process(img):
@@ -137,19 +199,6 @@ def post_process(img):
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
     morph_open = cv2.morphologyEx(flood_filled, cv2.MORPH_OPEN, kernel, iterations=2)
 
-    if debug_switch == 1:
-        mask_list = [[threshold_hue_dir, threshed_hue, 'threshold_hue'],
-                     [threshold_value_dir, threshed_value, 'threshold_value'],
-                     [threshed_dir, threshed, 'threshed'],
-                     [flood_fill_dir, flood_filled, 'flood_filled'],
-                     [morph_open_dir, morph_open, 'morph_open']]
-        stacker = []
-        for item in mask_list:
-            stacker.append(print_image(img, item))
-        stack1 = np.hstack([img, stacker[0], stacker[1]])
-        stack2 = np.hstack([stacker[2], stacker[3], stacker[4]])
-        stack = np.vstack((stack1, stack2))
-        cv2.imwrite(merge_post_process_dir + current_filename, stack)
 
     clk_post_process.stop()
     print(', ', end='', flush=True)
@@ -192,7 +241,7 @@ def label_img(img):
     bboxes = cvt_stats_to_bboxes(stats)
     if debug_switch == 1:
         label_hue = cvt_label_to_image(labels)
-        cv2.imwrite(ccl_dir + current_filename, label_hue)
+        cv2.imwrite(LABEL_PATH + current_filename, label_hue)
     clk_labeling.stop()
     print(', ', end='', flush=True)
     return labels, bboxes
@@ -331,7 +380,7 @@ def print_box(boxes, img):
         xmax = item[3]
         ymax = item[4]
         cv2.rectangle(img, (xmin, ymin), (xmax, ymax), color, 2)
-    cv2.imwrite(bbox_dir + current_filename, img)
+    cv2.imwrite(BBOX_PATH + current_filename, img)
     print(', ', end='', flush=True)
 
 
@@ -403,7 +452,7 @@ def find_plt(img, labels):
 
 def cbc():
     global clk_total
-    file_list = [_ for _ in os.listdir(original_dir) if _.endswith('.jpg')]
+    file_list = [_ for _ in os.listdir(INPUT_PATH) if _.endswith('.jpg')]
 
     for page, file in enumerate(file_list):
         global current_filename
@@ -411,7 +460,7 @@ def cbc():
 
         clk_total.start()
         print('%s (%s/%d) : ' % (current_filename, str(page + 1).zfill(2), len(file_list)), end='', flush=True)
-        img_origin = cv2.imread(original_dir + current_filename)
+        img_origin = cv2.imread(INPUT_PATH + current_filename)
 
         img_threshed = post_process(img_origin)
         labels, bboxes = label_img(img_threshed)
@@ -419,9 +468,9 @@ def cbc():
         bboxes.extend(plt_bboxes)
         bboxes = organize_bbox(img_origin, bboxes)
 
-        title = ['result', current_filename, result_dir + current_filename, '0',
+        title = ['result', current_filename, OUTPUT_PATH + current_filename, '0',
                  str(len(img_origin[0])), str(len(img_origin)), '3', '0']
-        labelimg_xml.write_xml(title, bboxes, result_dir, current_filename.split('.')[0] + '.xml')
+        labelimg_xml.write_xml(title, bboxes, OUTPUT_PATH, current_filename.split('.')[0] + '.xml')
         print('done.')
         clk_total.stop()
 
