@@ -8,8 +8,6 @@ import time
 import sys
 import argparse
 
-import get_roi
-
 debug_switch = 0
 scope_switch = 0
 current_filename = ''
@@ -21,7 +19,6 @@ magnification = 0
 parser = argparse.ArgumentParser(description='Complete Blood Count with OpenCV')
 parser.add_argument('-si', '--save-images', action='store_true', help='save output images')
 parser.add_argument('-t', '--show-running-time', action='store_true', help='show process running time')
-parser.add_argument('-rs', '--remove-scope', action='store_true', help='image has scope')
 parser.add_argument('-m', '--magnification', default=1000, action='store', help='set manual magnification')
 args = parser.parse_args()
 
