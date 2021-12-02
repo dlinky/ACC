@@ -7,31 +7,24 @@ import numpy as np
 import time
 import sys
 import argparse
+import remove_scope
 
-debug_switch = 0
-scope_switch = 0
 current_filename = ''
-morph_kernel = 11
-morph_iteration = 1
-magnification = 0
 
 # parameters
 parser = argparse.ArgumentParser(description='Complete Blood Count with OpenCV')
-parser.add_argument('-si', '--save-images', action='store_true', help='save output images')
-parser.add_argument('-t', '--show-running-time', action='store_true', help='show process running time')
+parser.add_argument('-si', '--save-images', action='store_true', default=False, help='save output images')
+parser.add_argument('-t', '--run-time', action='store_true', default=False, help='show process run time')
 parser.add_argument('-m', '--magnification', default=1000, action='store', help='set manual magnification')
+parser.add_argument('-rs', '--remove-scope', action='store_true', default=False, help='remove scope')
 args = parser.parse_args()
 
-specific_magnification = False
-SAVE_IMAGE = False
-if args.magnification is not None:
-    specific_magnification = True
-    magnification = args.magnification
+# arguments
+magnification = args.magnification
+SAVE_IMAGE = args.save_images
+RUN_TIME = args.run_time
+REMOVE_SCOPE = args.remove_scope
 
-if args.save_images is not None:
-    SAVE_IMAGE = True
-    
-    
 # paths
 INPUT_PATH = os.path.join(os.getcwd(), 'input')
 OUTPUT_PATH = os.path.join(os.getcwd(), 'output')
@@ -62,7 +55,7 @@ class Clock:
     def stop(self):
         self.timestamp[-1] = time.time() - self.timestamp[-1]
 
-    def calulate_runningtime(self):
+    def get_run_time(self):
         self.max = max(self.timestamp)
         self.min = min(self.timestamp)
 
@@ -73,13 +66,36 @@ class Clock:
         return [self.min, self.max, self.sum, self.avg]
 
 
+def print_progress(iteration, total):
+    decimals = 1
+    barLength = 20
+    prefix = ''
+    suffix = ''
+    formatStr = "{0:." + str(decimals) + "f}"
+    percent = formatStr.format(100 * (iteration / float(total)))
+    filledLength = int(round(barLength * iteration / float(total)))
+    bar = '#' * filledLength + '-' * (barLength - filledLength)
+    sys.stdout.write('\r%s |%s| %s (%s%s) %s' % (prefix, bar, current_filename, percent, '%', suffix)),
+    if iteration == total:
+        sys.stdout.write('\n')
+    sys.stdout.flush()
+    
+
 clk_total = Clock('Whole Process')
-clk_post_process = Clock('Post-process')
-clk_labeling = Clock('Labeling')
-clk_organize_bbox = Clock('Organizing bbox')
+clk_detect = Clock('Detect cells')
+clk_classify = Clock('Classify cells')
 
 
 def threshold(src):
+    """
+    get pre-processed image
+    - otsu threshold to get foreground
+    - flood filling to fill inside
+    - open operation to remove noises
+
+    :param src: BGR image
+    :return: pre-processed binary image
+    """
     l, a, b = cv2.split(cv2.cvtColor(src, cv2.COLOR_BGR2LAB))
     _, threshed = cv2.threshold(a, 0, 255, cv2.THRESH_OTSU)
     cnts = cv2.findContours(threshed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -104,6 +120,12 @@ def label_cells(threshed):
 
 
 def cvt_label_to_image(labels):
+    """
+    convert from label image to color images
+    make empty np.array and filling HSV image, and convert to BGR
+    :param labels:
+    :return:
+    """
     image = np.zeros((len(labels), len(labels[0]), 3), 'uint8')
     for r, line in enumerate(labels):
         for c, item in enumerate(line):
@@ -132,6 +154,11 @@ def remove_border_touching_bbox(labels, stats, edge_error):
 
 
 def double_threshold(img):
+    """
+    process otsu threshold twice with a
+    :param img: 
+    :return: 
+    """
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
     ret_cell, th1_a = cv2.threshold(a, 0, 255, cv2.THRESH_OTSU + cv2.THRESH_TOZERO)
@@ -150,64 +177,48 @@ def find_wbc(img, stats):
     return wbcs, stats
 
 
-def classify_boxes(num_clst, stats):
-    # Step 1 : 그룹의 갯수를 정하고, 각 그룹의 중심 값을 정함
-
+def cluster_boxes(num_clst, stats):
     data = np.array(stats).T[4].astype('int16')
     data = np.array(data)
-    # num_clst = 3
 
     mxmn = [np.min(data), np.max(data)]
     quan = (mxmn[1] - mxmn[0]) / num_clst / 2
+    clst_mu = np.array([quan * (2 * i + 1) + mxmn[0] for i in range(num_clst)])
 
-    # 클러스터의 갯수만큼 중심점을 만듬
-    clst_mu = np.array([quan * (2*i+1) + mxmn[0] for i in range(num_clst)])
-    # print(f'* 각 클러스터별 평균(설정) : {clst_mu}')
-
-    # Step 2 : 각 데이터에서 가장 가까운 그룹을 찾아서 그룹을 할당
-
-    # 데이터별 중심점과의 거리를 계산
     diff = np.abs(data - clst_mu.reshape((num_clst, 1))).T
-
-    # 그룹을 할당
     clst = np.where(diff == diff.min(axis=1).reshape((len(data), 1)))[1]
     if len(clst) > len(data):
         for count in range(len(clst) - len(data)):
             clst = np.delete(clst, len(clst) - 1)
 
-    # Step 3 : 할당 결과를 가지고 그룹의 중심점을 재계산
     for i in range(num_clst):
         clst_mu[i] = np.mean(data[np.where(clst == i)[0]])
-        # print(data[np.where(clst==i)[0]])
-    print(f'* 각 클러스터 평균(초기) : {clst_mu}')
 
-    # Step 4 : 2,3 스텝을 계속 반복
-
-    maxEpoch = 10
+    maxEpoch = 5
     for epoch in range(maxEpoch):
-        print(f'#{epoch+1}')
         diff = np.abs(data - clst_mu.reshape((num_clst, 1))).T
         clst = np.where(diff == diff.min(axis=1).reshape((len(data), 1)))[1]
-        print(clst)
-
         for i in range(num_clst):
             clst_mu[i] = np.mean(data[np.where(clst == i)[0]])
 
-        print(f'* 각 클러스터 평균(#{epoch}) : {clst_mu}')
-
-    label_list = ['Platelets', 'RBC', 'RBC', 'WBC'] # 일반 RBC, 덩어리진 RBC
+    label_list = ['Platelets', 'RBC', 'Connected RBC', 'WBC']  # 일반 RBC, 덩어리진 RBC
     for idx, label_idx in enumerate(clst):
         if idx == 3:
             if stats[idx][-1] == 'WBC':
                 pass
             else:
-                stats[idx][-1] = 'RBC'
+                stats[idx][-1] = 'Connected RBC'
         else:
             stats[idx][-1] = label_list[label_idx]
     return stats
 
 
-def cvt_stats_to_bboxes(stats):
+def classify_boxes(num_clst, stats):
+    stats = cluster_boxes(num_clst, stats)
+    return stats
+
+
+def cvt_stat(stats):
     bboxes = []
     for line in stats:
         bboxes.append([line[5], line[0], line[1], line[0]+line[2], line[1]+line[3]])
@@ -215,8 +226,8 @@ def cvt_stats_to_bboxes(stats):
 
 
 def print_box(boxes, img):
-    names = ['WBC', 'RBC', 'Platelets', 'Undefined']
-    colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 255)]
+    names = ['WBC', 'Connected RBC', 'RBC', 'Platelets', 'Undefined']
+    colors = [(255, 255, 255), (100, 100, 255), (0, 0, 255), (255, 0, 0), (100, 100, 100)]
     for i, item in enumerate(boxes):
         color = colors[names.index(item[0])]
         xmin = item[1]
@@ -260,21 +271,22 @@ def write_xml(img, table):
     tree.write(os.path.join(XML_PATH, current_filename))
 
 
-def calculate_elapsed_time():
-    index_label = ['post-process', 'ccl', 'organizing bbox', 'whole process']
+def print_run_time():
+    clocks = [clk_detect, clk_classify, clk_total]
+    index_label = [_.title for _ in clocks]
 
-    print('processed images : %d' % len(clk_total.timestamp), end='\n\n')
+    print('\n\nprocessed images : %d' % len(clk_total.timestamp), end='\n\n')
     print('─' * 60)
-    title_text = '{0:^15} │ {1:^6} │ {2:^6} │ {3:^6} │ {4:^9}'.format('process', 'min', 'max', 'avg', 'total')
+    title_text = f'{"process":^15} │ {"min":^6} │ {"max":^6} │ {"avg":^6} │ {"total":^9}'
     len_text = len(title_text)
     print(title_text)
-    for index, item in enumerate([clk_post_process, clk_labeling, clk_organize_bbox, clk_total]):
-        item.calulate_runningtime()
-        text_title = '{0:<15}'.format(index_label[index])
-        min_text = '{:>6}'.format('%.3f' % item.min)
-        max_text = '{:>6}'.format('%.3f' % item.max)
-        avg_text = '{:>6}'.format('%.3f' % item.avg)
-        sum_text = '{:>9}'.format('%.3f' % item.sum)
+    for index, item in enumerate(clocks):
+        item.get_run_time()
+        text_title = f'{index_label[index]:<15}'
+        min_text = f'{item.min:>6.3f}'
+        max_text = f'{item.max:>6.3f}'
+        avg_text = f'{item.avg:>6.3f}'
+        sum_text = f'{item.sum:>9.3f}'
         if index == 0 or index == -1:
             print('─' * len_text)
         print('%s │ %s │ %s │ %s │ %s' % (text_title, min_text, max_text, avg_text, sum_text))
@@ -294,26 +306,28 @@ def main():
     if len(file_list) == 0:
         error("Error: No input files found")
     for idx, filename in enumerate(file_list):
+        clk_total.start()
+        print_progress(idx, len(file_list))
         global current_filename
         current_filename = os.path.basename(filename)
+
         img = cv2.imread(os.path.join(INPUT_PATH, filename))
-        print('threshold')
+        
+        clk_detect.start()
         threshed = threshold(img)
-        print('labeling')
         labels, stats = label_cells(threshed)
         labels, stats = remove_border_touching_bbox(labels, stats, 1)
-
-        print('find wbc')
+        clk_detect.stop()
+        
+        clk_classify.start()
         wbcs, stats = find_wbc(img, stats)
-        for line in stats:
-            print(line)
         if wbcs > 0:
-            num_clst = 4
-        else:
             num_clst = 3
-        print('classify')
+        else:
+            num_clst = 2
         stats = classify_boxes(num_clst, stats)
-        bboxes = cvt_stats_to_bboxes(stats)
+        bboxes = cvt_stat(stats)
+        clk_classify.stop()
 
         if SAVE_IMAGE:
             labels_color = cvt_label_to_image(labels)
@@ -321,7 +335,11 @@ def main():
             print_box(bboxes, img)
 
         write_xml(img, bboxes)
+        clk_total.stop()
 
+    if RUN_TIME:
+        print_run_time()
+        
 
 if __name__ == '__main__':
     main()
