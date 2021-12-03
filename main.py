@@ -312,7 +312,12 @@ def main():
         current_filename = os.path.basename(filename)
 
         img = cv2.imread(os.path.join(INPUT_PATH, filename))
-        
+        if REMOVE_SCOPE:
+            cropped_img = remove_scope.get_cropped_img(img, find_manually=False)
+            if cropped_img is None:
+                continue
+            else:
+                img = cropped_img
         clk_detect.start()
         threshed = threshold(img)
         labels, stats = label_cells(threshed)
