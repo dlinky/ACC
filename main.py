@@ -208,11 +208,12 @@ def watershed(labels, box, img):
     box_label = box[-2]
     roi = img.copy()[rmin:rmax, cmin:cmax]
     a = cv2.split(cv2.cvtColor(roi, cv2.COLOR_BGR2LAB))[1]
-    mask = labels.copy()[rmin:rmax, cmin:cmax]
+
+    mask = np.uint8(labels[rmin:rmax, cmin:cmax])
     mask[mask != box_label] = 0
     mask[mask == box_label] = 255
-    mask = np.uint8(mask)
     masked = cv2.bitwise_and(a, a, mask=mask)
+
     _, threshed = cv2.threshold(masked, 0, 255, cv2.THRESH_OTSU + cv2.THRESH_BINARY)
     kernel = np.ones((3,3))
     opening = cv2.morphologyEx(threshed, cv2.MORPH_OPEN, kernel, iterations=2)
