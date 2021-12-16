@@ -126,7 +126,7 @@ def main():
         cropped_img = crop_scope(img, scope)
         cv2.imwrite(os.path.join(OUTPUT_PATH, filename), cropped_img)
         if args.verify:
-            cv2.circle(img, (scope[0], scope[1]), scope[2], (0, 255, 0), 2)
+            cv2.circle(img, (scope[0], scope[1]), scope[2], (0, 255, 0), 5)
             cv2.imwrite(os.path.join(SCOPE_PATH, filename), img)
 
 

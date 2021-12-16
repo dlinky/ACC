@@ -90,17 +90,41 @@ def print_progress(iteration, total):
     if iteration == total:
         sys.stdout.write('\n')
     sys.stdout.flush()
-    
+
 
 clk_total = Clock('Whole Process')
 clk_detect = Clock('Detect cells')
 clk_classify = Clock('Classify cells')
 
 
+def threshold(src):
+    """
+    get pre-processed image
+    - otsu threshold to get foreground
+    - flood filling to fill inside
+    - open operation to remove noises
+
+    :param src: BGR image
+    :return: pre-processed binary image
+    """
+    l, a, b = cv2.split(cv2.cvtColor(src, cv2.COLOR_BGR2LAB))
+    _, threshed = cv2.threshold(a, 0, 255, cv2.THRESH_OTSU)
+    cnts = cv2.findContours(threshed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cnts = cnts[0] if len(cnts) == 2 else cnts[1]
+    for c in cnts:
+        threshed = cv2.drawContours(threshed, [c], 0, (255, 255, 255), -1)
+    morph_open = cv2.morphologyEx(threshed, cv2.MORPH_OPEN, np.ones((5, 5)), iterations=2)
+    if SAVE_IMAGE:
+        temp = src[:]
+        temp[morph_open == 0] = 0
+        cv2.imwrite(os.path.join(THRESHOLD_PATH, current_filename), temp)
+    return morph_open
+
+
 def label_cells(threshed):
     _, labels, stats, _ = cv2.connectedComponentsWithStats(threshed)
     label = np.full((len(stats), 1), UNKNOWN, np.uint8)
-    idx = np.array(range(len(stats)), np.uint8).reshape(len(stats),1)
+    idx = np.array(range(len(stats)), np.uint8).reshape(len(stats), 1)
     stats = np.concatenate((stats, idx, label), axis=1)
     return labels, stats[1:]
 
@@ -118,7 +142,7 @@ def cvt_label_to_image(labels):
             if item == 0:
                 image[r][c] = [0, 0, 0]
             else:
-                image[r][c] = [(item*5) % 180, 255, 255]
+                image[r][c] = [(item * 5) % 180, 255, 255]
     image = cv2.cvtColor(image, cv2.COLOR_HSV2BGR)
     return image
 
@@ -133,179 +157,51 @@ def remove_border_touching_bbox(labels, stats, edge_error):
         tboard = box[1] < edge_error
         bboard = box[1] + box[3] > width - edge_error
         if lboard or rboard or tboard or bboard:
-            labels[labels == idx+1] = 0
+            labels[labels == idx + 1] = 0
             remove_stats.append(idx)
     stats = np.delete(stats, remove_stats, axis=0)
     cv2.waitKey(0)
     return labels, stats[1:]
 
 
-def double_threshold(roi):
-    """
-    process otsu threshold twice with a
-    :param roi:
-    :return: 
-    """
-    lab = cv2.cvtColor(roi, cv2.COLOR_BGR2LAB)
+def detect_by_size(img, normal_size):
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
-    ret_cell, th1_a = cv2.threshold(a, 0, 255, cv2.THRESH_OTSU + cv2.THRESH_TOZERO)
-    th1_a[th1_a == 0] = ret_cell
-    ret_nucleus, th2_a = cv2.threshold(th1_a, 0, 255, cv2.THRESH_OTSU + cv2.THRESH_BINARY)
 
-    return ret_cell, ret_nucleus
+    wbcMinRadius = int(normal_size * 1.5)
+    wbcMaxRadius = int(normal_size * 3)
+    rbcMinRadius = int(normal_size * 0.75)
+    rbcMaxRadius = int(normal_size * 1.49)
+    pltMinRadius = int(normal_size * 0.1)
+    pltMaxRadius = int(normal_size * 0.74)
+    print(wbcMinRadius, wbcMaxRadius, rbcMinRadius, rbcMaxRadius, pltMinRadius, pltMaxRadius)
 
-
-def find_wbc(img, stats):
-
-    wbcs = 0
-    for box in stats:
-        roi = img[box[1]:box[1]+box[3], box[0]:box[0]+box[2]]
-        ret_cell, ret_nucleus = double_threshold(roi)
-        if ret_nucleus - ret_cell > 10:
-            box[-1] = WBC
-            wbcs += 1
-            if SAVE_IMAGE:
-                a = cv2.split(cv2.cvtColor(roi, cv2.COLOR_BGR2HSV))[1]
-                _, mask_cell = cv2.threshold(a, ret_cell, 255, cv2.THRESH_TOZERO)
-                masked_cell = cv2.bitwise_and(roi, roi, mask=mask_cell)
-                _, mask_nucleus = cv2.threshold(a, ret_nucleus, 255, cv2.THRESH_TOZERO)
-                masked_nucleus = cv2.bitwise_and(roi, roi, mask=mask_nucleus)
-                masked_img = cv2.addWeighted(masked_cell, 0.5, masked_nucleus, 0.5, 0)
-                cv2.imwrite(os.path.join(CLASSES_PATH, current_filename.replace('.jpg', f'-wbc{wbcs}.jpg')), masked_img)
-    return wbcs, stats
-
-
-def threshold(img):
-    a = cv2.split(cv2.cvtColor(img, cv2.COLOR_BGR2LAB))[1]
-
-    _, threshed = cv2.threshold(a, 0, 255, cv2.THRESH_OTSU + cv2.THRESH_BINARY)
-    cnts = cv2.findContours(threshed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    cnts = cnts[0] if len(cnts) == 2 else cnts[1]
-    for c in cnts:
-        flood_filled = cv2.drawContours(threshed, [c], 0, (255, 255, 255), -1)
-    kernel = np.ones((3, 3))
-    opening = cv2.morphologyEx(flood_filled, cv2.MORPH_OPEN, kernel, iterations=2)
-
-    if SAVE_IMAGE:
-        temp = a.copy()
-        temp[opening == 0] = 0
-        cv2.imwrite(os.path.join(THRESHOLD_PATH, current_filename), temp)
-
-    return opening
-
-
-def detect_watershed(img):
-    opening = threshold(img)
-    kernel = np.ones((3, 3))
-    sure_bg = cv2.dilate(opening, kernel, iterations=3)
-
-    dist_transform = cv2.distanceTransform(opening, cv2.DIST_L2, 5)
-    _, sure_fg = cv2.threshold(dist_transform, 0.38 * dist_transform.max(), 255, 0)
-    sure_fg = np.uint8(sure_fg)
-    unknown = cv2.subtract(sure_bg, sure_fg)
-
-    _, markers = cv2.connectedComponents(sure_fg)
-    markers = markers + 1
-    markers[unknown == 255] = 0
-    markers = cv2.watershed(img, markers)
-    markers[markers == -1] = 0
-    markers[markers == 1] = 0
-    markers = cv2.morphologyEx(np.uint8(markers), cv2.MORPH_OPEN, kernel)
-    _, labels, stats, _ = cv2.connectedComponentsWithStats(np.uint8(markers), connectivity=4)
-
-    '''images = [a, opening, sure_bg, dist_transform, sure_fg, unknown, markers, img]
-    titles = ['Gray', 'Threshed', 'Sure BG', 'Distance', 'Sure FG', 'Unknown', 'Markers', 'Result']
-
-    for i in range(len(images)):
-        plt.subplot(2, 4, i + 1), plt.imshow(images[i]), plt.title(titles[i]), plt.xticks([]), plt.yticks([])
-    plt.show()'''
-
-    return labels, stats[1:]
-
-
-def separate_with_circle(img, box):
-    roi = img[box[1]-2:box[1] + box[3]+2, box[0]-2:box[0] + box[2]+2]
-    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    windowName = 'separate'
+    # WBC
+    windowName = 'detect by size'
     cv2.namedWindow(windowName)
-    cv2.createTrackbar('mindist', windowName, 1, 100, empty)
-    cv2.createTrackbar('param1', windowName, 1, 255, empty)
-    cv2.createTrackbar('param2', windowName, 1, 255, empty)
-    cv2.createTrackbar('minradius', windowName, 1, 255, empty)
-    cv2.createTrackbar('maxradius', windowName, 1, 255, empty)
-
+    cv2.createTrackbar('minDist', windowName, 3, 100, empty)
+    cv2.createTrackbar('param1', windowName, 3, 255, empty)
+    cv2.createTrackbar('param2', windowName, 3, 255, empty)
+    cv2.createTrackbar('minRadius', windowName, 3, 200, empty)
+    cv2.createTrackbar('maxRadius', windowName, 3, 200, empty)
     while True:
-        temp = copy.deepcopy(roi)
         if cv2.waitKey(10) == 27:
             break
-        minDist = cv2.getTrackbarPos('mindist', windowName)
+        temp = img.copy()
+
+        minDist = cv2.getTrackbarPos('minDist', windowName)
         param1 = cv2.getTrackbarPos('param1', windowName)
         param2 = cv2.getTrackbarPos('param2', windowName)
-        minRadius = cv2.getTrackbarPos('minradius', windowName)
-        maxRadius = cv2.getTrackbarPos('maxradius', windowName)
-        circles = cv2.HoughCircles(gray, cv2.HOUGH_GRADIENT, 1, minDist=minDist+1, param1=param1, param2=param2, minRadius=minRadius, maxRadius=maxRadius)
+        minRadius = cv2.getTrackbarPos('minRadius', windowName)
+        maxRadius = cv2.getTrackbarPos('maxRadius', windowName)
+        circles = cv2.HoughCircles(a, cv2.HOUGH_GRADIENT, 0.3, minDist, param1=param1, param2=param2, minRadius=minRadius, maxRadius=maxRadius)
+        #circles = np.uint16(np.around(circles))
+
         if circles is not None:
             for i in circles[0,:]:
                 cv2.circle(temp, (i[0], i[1]), i[2], (0, 255, 0), 2)
 
-        cv2.resizeWindow(windowName, 500, 1000)
         cv2.imshow(windowName, temp)
-    circles = cv2.HoughCircles(gray, cv2.HOUGH_GRADIENT, 1, minDist=minDist, param1=param1, param2=param2,
-                               minRadius=minRadius, maxRadius=maxRadius)
-    if circles is not None:
-        new_box = np.zeros((1, 6))
-        for i in circles[0,:]:
-            x_min = int(i[0]-i[2])
-            y_min = int(i[1]-i[2])
-            new_box = np.append(new_box, [x_min, y_min, int(2*i[2]), int(2*i[2]), int(2*3.14*i[2]**2)])
-        return new_box
-    else:
-        return box
-
-
-def cluster_boxes(num_clst, stats):
-    data = np.array(stats).T[4].astype('int16')
-    data = np.array(data)
-    rbc_size = int(np.mean(data))
-    if num_clst == 2:
-        clst_mu = np.array((rbc_size*0.5, rbc_size))
-    else:
-        clst_mu = np.array((rbc_size*0.5, rbc_size, rbc_size*1.5))
-    '''mxmn = [np.min(data), np.max(data)]
-    quan = (mxmn[1] - mxmn[0]) / num_clst / 2
-    clst_mu = np.array([quan * (2 * i + 1) + mxmn[0] for i in range(num_clst)])'''
-
-    diff = np.abs(data - clst_mu.reshape((num_clst, 1))).T
-    clst = np.where(diff == diff.min(axis=1).reshape((len(data), 1)))[1]
-    if len(clst) > len(data):
-        for count in range(len(clst) - len(data)):
-            clst = np.delete(clst, len(clst) - 1)
-
-    for i in range(num_clst):
-        clst_mu[i] = np.mean(data[np.where(clst == i)[0]])
-
-    maxEpoch = 5
-    for epoch in range(maxEpoch):
-        diff = np.abs(data - clst_mu.reshape((num_clst, 1))).T
-        clst = np.where(diff == diff.min(axis=1).reshape((len(data), 1)))[1]
-        for i in range(num_clst):
-            clst_mu[i] = np.mean(data[np.where(clst == i)[0]])
-
-    label_list = [PLATELET, RBC, WBC, UNKNOWN]  # 일반 RBC, 덩어리진 RBC
-    for idx, label_idx in enumerate(clst):
-        if idx == 3:
-            if stats[idx][-1] == WBC:
-                pass
-            else:
-                stats[idx][-1] = RBC
-        else:
-            stats[idx][-1] = label_list[label_idx]
-    return stats
-
-
-def classify_boxes(num_clst, stats):
-    stats = cluster_boxes(num_clst, stats)
-    return stats
 
 
 def cvt_stat(stats):
@@ -396,8 +292,6 @@ def main():
         os.makedirs(WATERSHED_PATH)
 
     file_list = glob.glob(INPUT_PATH + '/*.jpg')
-    cell_labels = ['WBC', 'RBC', 'Platelet']
-    cell_counts = []
     if len(file_list) == 0:
         error("Error: No input files found")
     for page, filename in enumerate(file_list):
@@ -415,42 +309,15 @@ def main():
                 img = cropped_img
 
         clk_detect.start()
-        labels, stats = detect_watershed(img)
-        labels, stats = remove_border_touching_bbox(labels, stats, 3)
-        clk_detect.stop()
-        
-        clk_classify.start()
-        wbcs, stats = find_wbc(img, stats)
-        if wbcs > 0:
-            num_clst = 3
-        else:
-            num_clst = 2
-        stats = classify_boxes(num_clst, stats)
-        bboxes = cvt_stat(stats)
-        clk_classify.stop()
+        threshed = threshold(img)
+        labels, stats = label_cells(threshed)
+        labels, stats = remove_border_touching_bbox(labels, stats, 1)
 
-        if SAVE_IMAGE:
-            labels_color = cvt_label_to_image(labels)
-            cv2.imwrite(os.path.join(LABEL_PATH, current_filename), labels_color)
-            print_box(bboxes, img)
+        normal_area = np.mean(stats.T[4])
+        normal_size = normal_area**(0.5)
 
-        cell_counts.append([0,0,0])
-        for box in bboxes:
-            cell_counts[-1][box[0]] += 1
+        detect_by_size(img, normal_size)
 
-        write_xml(img, bboxes)
-        clk_total.stop()
 
-    print('\n\n')
-    print(f'{"file name":^12} | {"WBC":^5} | {"RBC":^5} | {"Platelets":^12}')
-    for filepath, counts in zip(file_list, cell_counts):
-        filename = os.path.basename(filepath)
-        print(f'{filename:^12} | {str(counts[0]):>5} | {str(counts[1]):>5} | {str(counts[2]):>12}')
-    print('\n\n')
-
-    if RUN_TIME:
-        print_run_time()
-        
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
